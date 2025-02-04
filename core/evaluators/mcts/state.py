@@ -30,7 +30,7 @@ class MCTSNode:
         return self.q * self.n
 
 
-# an MCTSTree is a Tree containing MCTSNodes
+# an MCTSTree is a Tree containing MCTSNodes 
 MCTSTree = Tree[MCTSNode] 
 
 
@@ -64,6 +64,7 @@ class MCTSOutput(EvalOutput):
     """
     eval_state: MCTSTree
     policy_weights: chex.Array
+    root_value: float
 
 
 def tree_to_graph(tree, batch_id=0):

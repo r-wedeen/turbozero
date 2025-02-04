@@ -8,17 +8,17 @@ import jax.numpy as jnp
 @dataclass(frozen=True)
 class BaseExperience:
     """Experience data structure. Stores a training sample.
-    - `reward`: reward for each player in the episode this sample belongs to
+    - `reward`: reward attained to get to this state
+    - `bootstrapped_return`: bootstrapped return for this state
     - `policy_weights`: policy weights
     - `policy_mask`: mask for policy weights (mask out invalid/illegal actions)
     - `observation_nn`: observation for neural network input
-    - `cur_player_id`: current player id
     """
-    reward: chex.Array
+    reward: float
     policy_weights: chex.Array
     policy_mask: chex.Array
     observation_nn: chex.Array
-    cur_player_id: chex.Array
+    bootstrapped_return: float=0.0
 
 
 @dataclass(frozen=True)
@@ -30,15 +30,15 @@ class ReplayBufferState:
     - `episode_start_idx`: index where the current episode started, samples are placed in order
     - `buffer`: buffer of experiences
     - `populated`: mask for populated buffer indices
-    - `has_reward`: mask for buffer indices that have been assigned a reward
+    - `has_return`: mask for buffer indices that have been assigned a return
         - we store samples from in-progress episodes, but don't want to be able to sample them 
         until the episode is complete
     """
-    next_idx: int
-    episode_start_idx: int
-    buffer: BaseExperience
-    populated: chex.Array
-    has_reward: chex.Array
+    next_idx: chex.Array # type: int32, shape = (batch_size,)
+    episode_start_idx: chex.Array # type: int32, shape = (batch_size,)
+    buffer: BaseExperience # type: BaseExperience, shape = (batch_size, capacity, ...)
+    populated: chex.Array # type: bool, shape = (batch_size, capacity)
+    has_return: chex.Array # type: bool, shape = (batch_size, capacity)
 
 
 class EpisodeReplayBuffer:
@@ -80,58 +80,48 @@ class EpisodeReplayBuffer:
             ),
             next_idx = (state.next_idx + 1) % self.capacity,
             populated = state.populated.at[state.next_idx].set(True),
-            has_reward = state.has_reward.at[state.next_idx].set(False)
+            has_return = state.has_return.at[state.next_idx].set(False)
         )
     
 
-    def assign_rewards(self, state: ReplayBufferState, reward: chex.Array) -> ReplayBufferState:
-        """ Assign rewards to the current episode.
+    def assign_returns(self, state: ReplayBufferState, final_value: float, gamma: float=1.0) -> ReplayBufferState:
+        """ Assign bootstrapped returns to the current episode.
         
         Args:
         - `state`: replay buffer state
-        - `reward`: rewards to assign (for each player)
+        - `final_value`: value of the final state in the episode
+        - `gamma`: discount factor
 
         Returns:
         - (ReplayBufferState): updated replay buffer state
         """
-        return state.replace(
+
+        shift = self.capacity - state.next_idx
+        rewards = jnp.roll(state.buffer.reward, shift=shift)
+        arr = jnp.zeros(self.capacity).at[-1].set(final_value)
+
+        mask = jnp.arange(self.capacity) >= (state.episode_start_idx + shift) % self.capacity
+
+        def body_fun(i, arr):
+            z = mask[i] * (gamma * arr[i+1] + rewards[i+1]) + (1-mask[i]) * arr[i]
+            return arr.at[i].set(z)
+
+        returns = jax.lax.fori_loop(2, self.capacity+1, lambda i, x: body_fun(self.capacity-i, x), arr)
+        returns = jnp.roll(returns, shift=-shift)
+
+        state = state.replace(
             episode_start_idx = state.next_idx,
-            has_reward = jnp.full_like(state.has_reward, True),
+            has_return = jnp.full_like(state.has_return, True),
             buffer = state.buffer.replace(
-                reward = jnp.where(
-                    ~state.has_reward[..., None],
-                    reward[None, ...],
-                    state.buffer.reward
+                bootstrapped_return = jnp.where(
+                    ~state.has_return,
+                    returns,
+                    state.buffer.bootstrapped_return
                 )
             )
         )
-    
 
-    def truncate(self,
-        state: ReplayBufferState,
-    ) -> ReplayBufferState:
-        """Truncates the replay buffer, removing all experiences from the current episode.
-        Use this if we want to discard all experiences from the current episode.
-        
-        Args:
-        - `state`: replay buffer state
-        
-        Returns:
-        - (ReplayBufferState): updated replay buffer state
-        """
-        # un-assigned trajectory indices have populated set to False
-        # so their buffer contents will be overwritten (eventually)
-        # and cannot be sampled
-        # so there's no need to overwrite them with zeros here
-        return state.replace(
-            next_idx = state.episode_start_idx,
-            has_reward = jnp.full_like(state.has_reward, True),
-            populated = jnp.where(
-                ~state.has_reward,
-                False,
-                state.populated 
-            )
-        )
+        return state
     
     # assumes input is batched!! (dont vmap/pmap)
     def sample(self,
@@ -156,7 +146,7 @@ class EpisodeReplayBuffer:
         """
         masked_weights = jnp.logical_and(
             state.populated,
-            state.has_reward
+            state.has_return
         ).reshape(-1)
 
         num_partitions = state.populated.shape[0]
@@ -202,5 +192,5 @@ class EpisodeReplayBuffer:
                 template_experience
             ),
             populated = jnp.full((batch_size, self.capacity,), fill_value=False, dtype=jnp.bool_),
-            has_reward = jnp.full((batch_size, self.capacity,), fill_value=True, dtype=jnp.bool_),
+            has_return = jnp.full((batch_size, self.capacity,), fill_value=True, dtype=jnp.bool_),
         )

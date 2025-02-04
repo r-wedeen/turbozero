@@ -22,7 +22,7 @@ class MCTS(Evaluator):
         branching_factor: int,
         max_nodes: int,
         num_iterations: int,
-        discount: float = -1.0,
+        discount: float = 1.0,
         temperature: float = 1.0,
         tiebreak_noise: float = 1e-8,
         persist_tree: bool = True
@@ -35,9 +35,7 @@ class MCTS(Evaluator):
         - `max_nodes`: allocated size of MCTS tree, any additional nodes will not be created, 
                 but values from out-of-bounds leaf nodes will still backpropagate
         - `num_iterations`: number of MCTS iterations to perform per evaluate call
-        - `discount`: discount factor for MCTS (default: -1.0)
-            - use a negative discount in two-player games (e.g. -1.0)
-            - use a positive discount in single-player games (e.g. 1.0)
+        - `discount`: discount factor for MCTS (default: 1.0)
         - `temperature`: temperature for root action selection (default: 1.0)
         - `tiebreak_noise`: magnitude of noise to add to policy weights for breaking ties (default: 1e-8)
         - `persist_tree`: whether to persist search tree state between calls to `evaluate` (default: True)
@@ -92,7 +90,7 @@ class MCTS(Evaluator):
         """
         # store current state metadata in the root node
         key, root_key = jax.random.split(key)
-        eval_state = self.update_root(root_key, eval_state, env_state, params, root_metadata=root_metadata)
+        eval_state, root_value = self.update_root(root_key, eval_state, env_state, params, root_metadata=root_metadata)
         # perform 'num_iterations' iterations of MCTS
         iterate = partial(self.iterate, params=params, env_step_fn=env_step_fn)
 
@@ -104,7 +102,8 @@ class MCTS(Evaluator):
         return MCTSOutput(
             eval_state=eval_state,
             action=action,
-            policy_weights=policy_weights
+            policy_weights=policy_weights,
+            root_value=root_value
         )
     
 
@@ -121,7 +120,7 @@ class MCTS(Evaluator):
     
 
     def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, 
-                    params: chex.ArrayTree, **kwargs) -> MCTSTree: #pylint: disable=unused-argument
+                    params: chex.ArrayTree, **kwargs) -> Tuple[MCTSTree, float]: #pylint: disable=unused-argument
         """Populates the root node of an MCTSTree.
         
         Args:
@@ -132,6 +131,7 @@ class MCTS(Evaluator):
 
         Returns:
         - (MCTSTree): updated MCTSTree
+        - (float): network estimate of root value
         """
         # evaluate root state
         root_policy_logits, root_value = self.eval_fn(root_embedding, params, key)
@@ -139,7 +139,7 @@ class MCTS(Evaluator):
         # update root node
         root_node = tree.data_at(tree.ROOT_INDEX)
         root_node = self.update_root_node(root_node, root_policy, root_value, root_embedding)
-        return tree.set_root(root_node)
+        return tree.set_root(root_node), root_value
     
     
     def iterate(self, key: chex.PRNGKey, tree: MCTSTree, params: chex.ArrayTree, env_step_fn: EnvStepFn) -> MCTSTree:
@@ -151,7 +151,7 @@ class MCTS(Evaluator):
 
         Args:
         - `tree`: MCTSTree to evaluate
-        - `params`: parameters to pass to the the leaf evaluation function
+        - `params`: parameters to pass to the leaf evaluation function
         - `env_step_fn`: env step fn: (env_state, action) -> (new_env_state, metadata)
 
         Returns:
@@ -163,13 +163,13 @@ class MCTS(Evaluator):
         # get env state (embedding) for leaf node
         embedding = tree.data_at(parent).embedding
         new_embedding, metadata = env_step_fn(embedding, action)
-        player_reward = metadata.rewards[metadata.cur_player_id]
+        reward = metadata.reward
         # evaluate leaf node
         eval_key, key = jax.random.split(key)
         policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
-        value = jnp.where(metadata.terminated, player_reward, value)
+        value = jnp.where(metadata.terminated, reward, value)
         # add leaf node to tree
         node_exists = tree.is_edge(parent, action)
         node_idx = tree.edge_map[parent, action]
@@ -423,6 +423,7 @@ class MCTS(Evaluator):
 
         Returns:
         - (MCTSTree): initialized MCTSTree
+        - (float): network estimate of root value
         """
         return init_tree(self.max_nodes, self.branching_factor, self.new_node(
             policy=jnp.zeros((self.branching_factor,)),

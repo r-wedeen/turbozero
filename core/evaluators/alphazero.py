@@ -1,5 +1,5 @@
 
-from typing import Dict
+from typing import Dict, Tuple
 
 import chex
 import jax 
@@ -40,7 +40,7 @@ class _AlphaZero:
         }
 
 
-    def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, params: chex.ArrayTree, root_metadata: StepMetadata) -> MCTSTree:
+    def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, params: chex.ArrayTree, root_metadata: StepMetadata) -> Tuple[MCTSTree, float]:
         """Populates the root node of the search tree. Adds Dirichlet noise to the root policy.
         
         Args:
@@ -78,7 +78,7 @@ class _AlphaZero:
         # update the root node
         root_node = tree.data_at(tree.ROOT_INDEX)
         root_node = self.update_root_node(root_node, renorm_policy, root_value, root_embedding) #pylint: disable=no-member
-        return tree.set_root(root_node)
+        return tree.set_root(root_node), root_value
     
 
 class AlphaZero(MCTS):

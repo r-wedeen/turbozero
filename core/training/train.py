@@ -90,6 +90,7 @@ class Trainer:
         env_init_fn: EnvInitFn,
         state_to_nn_input_fn: StateToNNInputFn,
         testers: List[BaseTester],
+        expert_buffer: Optional[EpisodeReplayBuffer] = None,
         evaluator_test: Optional[Evaluator] = None,
         data_transform_fns: List[DataTransformFn] = [],
         extract_model_params_fn: Optional[ExtractModelParamsFn] = extract_params,
@@ -98,9 +99,13 @@ class Trainer:
         max_checkpoints: int = 2,
         num_devices: Optional[int] = None,
         wandb_run: Optional[Any] = None,
-        extra_wandb_config: Optional[dict] = None
+        extra_wandb_config: Optional[dict] = None,
+        bootstrap_from_mcts: bool = False,
+        move_length: int = 1,
+        temperature: float = 1.0,
+        env: Optional[Any] = None,
     ):
-        """
+        """ 
         Args:
         - `batch_size`: batch size for self-play games
         - `train_batch_size`: minibatch size for training steps
@@ -127,6 +132,9 @@ class Trainer:
         - `num_devices`: (optional) number of devices to use, defaults to jax.local_device_count()
         - `wandb_run`: (optional) wandb run object, will continue logging to this run if passed, else a new run is initialized
         - `extra_wandb_config`: (optional) extra config to pass to wandb
+        - `move_length`: (sampled alphazero) number of actions in a move 
+        - `temperature`: (sampled alphazero) temperature for the softmax function
+        - `env`: (sampled alphazero) if provided, step environment with each action/token prediction, otherwise fly blind
         """
         self.num_devices = num_devices if num_devices is not None else jax.local_device_count()
         # environment
@@ -145,6 +153,7 @@ class Trainer:
         self.warmup_steps = warmup_steps
         self.collection_steps_per_epoch = collection_steps_per_epoch
         self.memory_buffer = memory_buffer
+        self.expert_buffer = expert_buffer
         self.evaluator_train = evaluator
         self.transform_fns = data_transform_fns
         self.step_train = partial(step_env_and_evaluator,
@@ -153,6 +162,7 @@ class Trainer:
             env_init_fn=self.env_init_fn,
             max_steps=self.max_episode_steps
         )
+        self.bootstrap_from_mcts = bootstrap_from_mcts
         # training
         self.train_steps_per_epoch = train_steps_per_epoch
         self.train_batch_size = train_batch_size
@@ -183,6 +193,10 @@ class Trainer:
                 self.run = self.init_wandb(wandb_project_name, extra_wandb_config)
         else:
             self.run = None
+        # sampled alphazero
+        self.move_length = move_length
+        self.temperature = temperature
+        self.env = env
         # check batch sizes, etc. are compatible with number of devices
         self.check_size_compatibilities()
 
@@ -237,24 +251,26 @@ class Trainer:
         # initialize nn parameters
         variables = self.nn.init(key, sample_obs[None, ...], train=False)
         params = variables['params']
+        # initialize apply_fn
+        apply_fn = partial(self.nn.apply, move_length=self.move_length, temperature=self.temperature, env=self.env)
         # handle batchnorm
         if 'batch_stats' in variables:
             return TrainStateWithBS.create(
-                apply_fn=self.nn.apply,
+                apply_fn=apply_fn,
                 params=params,
                 tx=self.optimizer,
                 batch_stats=variables['batch_stats']
             )
-        # init TrrainState
+        # init TrainState
         return TrainState.create(
-            apply_fn=self.nn.apply,
+            apply_fn=apply_fn,
             params=params,
             tx=self.optimizer,
         )
 
         
     def get_config(self):
-        """Returns a dictionary of the configuration of the trainer. Used for logging/wand."""
+        """Returns a dictionary of the configuration of the trainer. Used for logging/wandb."""
         return {
             'batch_size': self.batch_size,
             'train_batch_size': self.train_batch_size,
@@ -274,7 +290,8 @@ class Trainer:
     def collect(self,
         key: jax.random.PRNGKey,
         state: CollectionState,
-        params: chex.ArrayTree
+        params: chex.ArrayTree,
+        bootstrap_from_mcts: bool = False
     ) -> CollectionState:
         """
         - Collects self-play data for a single step. 
@@ -289,8 +306,9 @@ class Trainer:
         Returns:
         - (CollectionState): updated collection state
         """
+
         # step environment and evaluator
-        eval_output, new_env_state, new_metadata, terminated, truncated, rewards = \
+        eval_output, new_env_state, new_metadata, terminated, truncated, reward = \
             self.step_train(
                 key = key,
                 env_state = state.env_state,
@@ -298,7 +316,7 @@ class Trainer:
                 eval_state = state.eval_state,
                 params = params
             )
-        
+            
         # store experience in replay buffer
         buffer_state = self.memory_buffer.add_experience(
             state = state.buffer_state,
@@ -306,11 +324,12 @@ class Trainer:
                 observation_nn=self.state_to_nn_input_fn(state.env_state),
                 policy_mask=state.metadata.action_mask,
                 policy_weights=eval_output.policy_weights,
-                reward=jnp.empty_like(state.metadata.rewards),
-                cur_player_id=state.metadata.cur_player_id
+                reward=state.metadata.reward,
+                bootstrapped_return=jnp.float32(0.0) # placeholder value; to be updated later
             )
         )
-        # apply transforms 
+
+        # apply transforms. NOTE: not used for AC
         for transform_fn in self.transform_fns:
             t_policy_mask, t_policy_weights, t_env_state = transform_fn(
                 state.metadata.action_mask,
@@ -323,24 +342,41 @@ class Trainer:
                     observation_nn=self.state_to_nn_input_fn(t_env_state),
                     policy_mask=t_policy_mask,
                     policy_weights=t_policy_weights,
-                    reward=jnp.empty_like(state.metadata.rewards),
-                    cur_player_id=state.metadata.cur_player_id
+                    reward=state.metadata.reward,
+                    bootstrapped_return=jnp.float32(0.0),
                 )
             )
-        # assign rewards to buffer if episode is terminated
+        
+        # assign returns to buffer if episode is terminated: bootstrap from -1 (env resets after termination so don't bootstrap from 0)
         buffer_state = jax.lax.cond(
             terminated,
-            lambda s: self.memory_buffer.assign_rewards(s, rewards),
+            lambda s: self.memory_buffer.assign_returns(s, final_value=-1.0),
             lambda s: s,
             buffer_state
         )
-        # truncate episode experiences in buffer if episode is too long
+        # assign returns to buffer if episode is truncated: bootstrap from predicted value
+        value_estimate = jax.lax.cond(
+            bootstrap_from_mcts,
+            lambda: self.evaluator_train.get_value(eval_output.eval_state),
+            lambda: eval_output.root_value
+        )
         buffer_state = jax.lax.cond(
             truncated,
-            self.memory_buffer.truncate,
+            lambda s: self.memory_buffer.assign_returns(s, final_value=value_estimate),
             lambda s: s,
             buffer_state
         )
+
+        state_arr ,goal_arr = jnp.split(state.env_state.observation, 2)
+        jax.debug.print("state array: {x}", x=state_arr)
+        jax.debug.print("goal array: {x}", x=goal_arr)
+        jax.debug.print("episode start idx: {x}", x=state.buffer_state.episode_start_idx)
+        jax.debug.print("current idx: {x}", x=state.buffer_state.next_idx)
+        jax.debug.print("terminated: {x}", x=terminated)
+        jax.debug.print("truncated: {x}", x=truncated)
+        jax.debug.print("rewards: {x}", x=buffer_state.buffer.reward.reshape(-1))
+        jax.debug.print("bootstrapped returns: {x}", x=buffer_state.buffer.bootstrapped_return.reshape(-1))
+
         # return new collection state
         return state.replace(
             eval_state=eval_output.eval_state,
@@ -349,12 +385,13 @@ class Trainer:
             metadata=new_metadata
         )
 
-    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 4))
+    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 4, 5))
     def collect_steps(self,
         key: chex.PRNGKey,
         state: CollectionState,
         params: chex.ArrayTree,
-        num_steps: int
+        num_steps: int,
+        bootstrap_from_mcts: bool = False
     ) -> CollectionState:
         """Collects self-play data for `num_steps` steps. Mapped across devices.
         
@@ -368,7 +405,7 @@ class Trainer:
         - (CollectionState): updated collection state
         """
         if num_steps > 0:
-            collect = partial(self.collect, params=params)
+            collect = partial(self.collect, params=params, bootstrap_from_mcts=bootstrap_from_mcts)
             keys = jax.random.split(key, num_steps)
             return jax.lax.fori_loop(
                 0, num_steps, 
@@ -518,8 +555,8 @@ class Trainer:
             observation_nn=self.state_to_nn_input_fn(env_state),
             policy_mask=metadata.action_mask,
             policy_weights=jnp.zeros_like(metadata.action_mask, dtype=jnp.float32),
-            reward=jnp.zeros_like(metadata.rewards),
-            cur_player_id=metadata.cur_player_id
+            reward=jnp.float32(0.0),
+            bootstrapped_return=jnp.float32(0.0)
         )
     
 
@@ -586,6 +623,7 @@ class Trainer:
             # initialize collection state
             init_key, key = jax.random.split(key)
             collection_state = partition(self.init_collection_state(init_key, self.batch_size), self.num_devices)
+
             # initialize train state
             init_key, key = jax.random.split(key)
             init_keys = jnp.tile(init_key[None], (self.num_devices, 1))
@@ -599,18 +637,18 @@ class Trainer:
         
         # warmup
         # populate replay buffer with initial self-play games
-        collect = jax.vmap(self.collect_steps, in_axes=(1, 1, None, None), out_axes=1)
+        collect = jax.vmap(self.collect_steps, in_axes=(1, 1, None, None, None), out_axes=1)
         params = self.extract_model_params_fn(train_state)
         collect_key, key = jax.random.split(key)
         collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
-        collection_state = collect(collect_keys, collection_state, params, self.warmup_steps)
+        collection_state = collect(collect_keys, collection_state, params, self.warmup_steps, self.bootstrap_from_mcts)
 
         # training loop
         while cur_epoch < num_epochs:
             # collect self-play games
             collect_key, key = jax.random.split(key)
             collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
-            collection_state = collect(collect_keys, collection_state, params, self.collection_steps_per_epoch)
+            collection_state = collect(collect_keys, collection_state, params, self.collection_steps_per_epoch, self.bootstrap_from_mcts)
             # train
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
